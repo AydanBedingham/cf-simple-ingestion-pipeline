@@ -1,0 +1,377 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "This example template shows how to create an ingestion pipeline using Lambda, SQS and S3 Buckets"
+
+Resources:
+
+  # Curated Bucket
+
+  CuratedJsonBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bckt-curated-json"
+
+  # Incoming Json to Curated Json
+
+  IncomingJsonBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bckt-incoming-json"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt IncomingJsonToCuratedJsonQueue.Arn
+            Filter: 
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".json"
+
+  IncomingJsonToCuratedJsonQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-queue-incoming-json-to-curated-json"
+      RedrivePolicy:
+        maxReceiveCount: 5
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - IncomingJsonToCuratedJsonDeadLetterQueue
+            - Arn
+  
+  IncomingJsonToCuratedJsonDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-dlq-incoming-json-to-curated-json"
+
+  CopyIncomingJsonToCuratedJsonLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lmbda-copy-incoming-json-to-curated-json"
+      Description: "Copies files from the Incoming Json Bucket to the Curated Json Bucket"
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt CopyIncomingJsonToCuratedJsonLambdaExecutionRole.Arn
+      Timeout: 30 # cannot be greater than queue timeout
+      Environment:
+        Variables:
+          DESTINATION_BUCKET_NAME: !Sub "${AWS::StackName}-bckt-curated-json"
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          from urllib.parse import unquote_plus
+
+          logger = logging.getLogger()
+          logger.setLevel('INFO')
+
+          s3 = boto3.resource('s3')
+
+          destination_bucket_name = os.environ['DESTINATION_BUCKET_NAME']
+
+          def process_s3_event_record(s3_event_record):
+            
+            source_bucket_name = s3_event_record['s3']['bucket']['name']
+            key = unquote_plus(s3_event_record['s3']['object']['key'])
+            
+            logger.info(f"Copying '{source_bucket_name}/{key}' to '{destination_bucket_name}/{key}'")
+            copy_source = {'Bucket': source_bucket_name, 'Key': key}
+            destination_bucket = s3.Bucket(destination_bucket_name)
+            destination_bucket.copy(copy_source, key)
+
+          def lambda_handler(event, context):
+            logger.info(f"event: {json.dumps(event)}")
+            messages_to_reprocess = []
+            
+            for sqs_record in event['Records']:
+              try:
+                logger.info(f"Processing SQS Record with Message Id: {sqs_record['messageId']}")
+                s3_event_records = json.loads(sqs_record['body'])['Records']
+                for s3_event_record in s3_event_records:
+                    process_s3_event_record(s3_event_record)
+              except Exception as e:
+                logger.warning(f"Failed to process SQS Record with Message Id: {sqs_record['messageId']}")
+                messages_to_reprocess.append({"itemIdentifier": sqs_record['messageId']})
+                logger.error(e)
+            
+            if len(messages_to_reprocess) > 0:
+              logger.error(f"Batch Item Failures: {messages_to_reprocess}")
+            
+            batch_failure_response = {"batchItemFailures": messages_to_reprocess}
+            return batch_failure_response
+
+  CopyIncomingJsonToCuratedJsonLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt IncomingJsonToCuratedJsonQueue.Arn
+      FunctionName: !Ref CopyIncomingJsonToCuratedJsonLambda
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      Enabled: True
+
+  CopyIncomingJsonToCuratedJsonLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lmbdaexec-copy-incoming-json-to-curated-json"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecutionRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: AccessQueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IncomingJsonToCuratedJsonQueue.Arn
+        - PolicyName: "ReadFromIncomingJsonBucket"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-incoming-json"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-incoming-json/*"
+        - PolicyName: "WriteToCuratedJsonBucket"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-curated-json"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-curated-json/*"
+
+  IncomingJsonToCuratedJsonQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IncomingJsonToCuratedJsonQueue
+      PolicyDocument:
+        Id: SQSQueuePolicy
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt IncomingJsonToCuratedJsonQueue.Arn
+            Principal:
+              Service: s3.amazonaws.com
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-bckt-incoming-json"
+
+
+  # Incoming Csv to Curated Json
+
+  IncomingCsvBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bckt-incoming-csv"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IncomingCsvToCuratedJsonQueue.Arn
+            Filter: 
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".csv"
+
+  IncomingCsvToCuratedJsonQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-queue-incoming-csv-to-curated-json"
+      RedrivePolicy:
+        maxReceiveCount: 5
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - IncomingCsvToCuratedJsonDeadLetterQueue
+            - Arn
+  
+  IncomingCsvToCuratedJsonDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-dlq-incoming-csv-to-curated-csv"
+
+  ConvertIncomingCsvToCuratedJsonLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lmbda-convert-incoming-csv-to-curated-json"
+      Description: "Converts/uploads files from the Incoming Csv Bucket to the Curated Json Bucket"
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt ConvertIncomingCsvToCuratedJsonLambdaExecutionRole.Arn
+      Timeout: 30 # cannot be greater than queue timeout
+      Environment:
+        Variables:
+          DESTINATION_BUCKET_NAME: !Sub "${AWS::StackName}-bckt-curated-json"
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          from urllib.parse import unquote_plus
+          import csv
+          from io import StringIO
+
+          logger = logging.getLogger()
+          logger.setLevel('INFO')
+
+          s3 = boto3.client('s3')
+
+          destination_bucket_name = os.environ['DESTINATION_BUCKET_NAME']
+
+          def convert_csv_to_json(csv_data):
+              # Read CSV data from memory
+              csv_stream = StringIO(csv_data)
+              csv_reader = csv.DictReader(csv_stream)
+
+              # Convert CSV data to a list of dictionaries
+              data = list(csv_reader)
+
+              # Convert data to JSON format
+              json_data = json.dumps(data)
+
+              return json_data
+
+          def process_s3_event_record(s3_event_record):  
+            source_bucket_name = s3_event_record['s3']['bucket']['name']
+            source_key = unquote_plus(s3_event_record['s3']['object']['key'])
+
+            logger.info(f"Reading CSV from '{source_bucket_name}/{source_key}'")
+            response = s3.get_object(Bucket=source_bucket_name, Key=source_key)
+            csv_data = response['Body'].read().decode('utf-8')
+
+            logger.info(f"Converting CSV to JSON")
+            json_data = convert_csv_to_json(csv_data)
+
+            destination_key = f'{source_key}.json'
+            logger.info(f"Uploading generated CSV to '{destination_bucket_name}/{destination_key}'")
+            s3.put_object(Body = json_data, Bucket=destination_bucket_name, Key=destination_key)
+
+          def lambda_handler(event, context):
+            logger.info(f"event: {json.dumps(event)}")
+            messages_to_reprocess = []
+            
+            for sqs_record in event['Records']:
+              try:
+                logger.info(f"Processing SQS Record with Message Id: {sqs_record['messageId']}")
+                s3_event_records = json.loads(sqs_record['body'])['Records']
+                for s3_event_record in s3_event_records:
+                    process_s3_event_record(s3_event_record)
+              except Exception as e:
+                logger.warning(f"Failed to process SQS Record with Message Id: {sqs_record['messageId']}")
+                messages_to_reprocess.append({"itemIdentifier": sqs_record['messageId']})
+                logger.error(e)
+            
+            if len(messages_to_reprocess) > 0:
+              logger.error(f"Batch Item Failures: {messages_to_reprocess}")
+            
+            batch_failure_response = {"batchItemFailures": messages_to_reprocess}
+            return batch_failure_response
+
+  ConvertIncomingCsvToCuratedJsonLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt IncomingCsvToCuratedJsonQueue.Arn
+      FunctionName: !Ref ConvertIncomingCsvToCuratedJsonLambda
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      Enabled: True
+
+  ConvertIncomingCsvToCuratedJsonLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lmbdaexec-copy-incoming-csv-to-curated-json"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecutionRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: AccessQueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IncomingCsvToCuratedJsonQueue.Arn
+        - PolicyName: "ReadFromIncomingCsvBucket"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-incoming-csv"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-incoming-csv/*"
+        - PolicyName: "WriteToCuratedJsonBucket"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-curated-json"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-bckt-curated-json/*"
+
+  IncomingCsvToCuratedJsonQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IncomingCsvToCuratedJsonQueue
+      PolicyDocument:
+        Id: SQSQueuePolicy
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt IncomingCsvToCuratedJsonQueue.Arn
+            Principal:
+              Service: s3.amazonaws.com
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-bckt-incoming-csv"
